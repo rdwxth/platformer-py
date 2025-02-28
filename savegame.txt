@@ -1,0 +1,1 @@
+{"hearts": 0, "level": 1, "checkpoint_x": null, "checkpoint_y": null, "active_powerup": null, "powerup_start_time": 0, "powerup_duration": 0}

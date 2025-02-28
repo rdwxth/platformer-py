@@ -2,6 +2,7 @@ import os
 import random
 import math
 import pygame
+import json
 from os import listdir
 from os.path import isfile, join
 
@@ -17,6 +18,7 @@ PLAYER_VEL = 10  # Player velocity
 HEARTS = 5
 LEVEL_TIME = 300  # 5 minutes
 LEVEL = 1
+SAVE_FILE = "savegame.txt"
 
 # Set up pygame window
 window = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -65,11 +67,17 @@ def load_sprite_sheets(dir1, dir2, width, height, direction=False):
 
 
 # Function that gets our blocks
-def get_block(size):
+def get_block(size, terrain_type="Terrain"):
+    # Always use the single terrain spritesheet
     path = join("assets", "Terrain", "Terrain.png")
     image = pygame.image.load(path).convert_alpha()
+    # Map terrain_type to a column index (assuming one row of tiles)
+    tile_map = {"Terrain": 0, "Terrain2": 1, "Terrain3": 2}
+    col = tile_map.get(terrain_type, 0)
+    # Define the rect based on the tile's column (row 0)
+    rect = pygame.Rect(col * size, 0, size, size)
+    # Create a new surface for the block
     surface = pygame.Surface((size, size), pygame.SRCALPHA, 32)
-    rect = pygame.Rect(96, 0, size, size)  # (96, 0) is the coordinate of top left corner of block
     surface.blit(image, (0, 0), rect)
     return pygame.transform.scale2x(surface)
 
@@ -225,9 +233,10 @@ class ImageButton:
 # Inheriting from this pygame class for our Player
 class Player(pygame.sprite.Sprite):
     COLOUR = (255, 0, 0)
-    GRAVITY = 1
+    GRAVITY = 9.8
     SPRITES = load_sprite_sheets("MainCharacters", "MaskDude", 32, 32, True)
     ANIMATION_DELAY = 3
+    INITIAL_JUMP_VELOCITY = -16  # Initial jump velocity
 
     def __init__(self, x, y, width, height):
         super().__init__()
@@ -244,6 +253,20 @@ class Player(pygame.sprite.Sprite):
         self.hit_count = 0
         self.hearts = HEARTS
         self.start_time = pygame.time.get_ticks()
+        self.checkpoint = None
+        self.active_powerup = None
+        self.powerup_start_time = 0
+        self.powerup_duration = 0
+        self.powerup_glow_timer = 0
+        self.powerup_glow_pulse = False
+        self.default_vel = PLAYER_VEL
+        self.default_gravity = self.GRAVITY
+        self.level = 1  # Track the current level
+        self.PLAYER_VEL = PLAYER_VEL # Store initial player velocity
+        self.GRAVITY = 9.8 # Store initial gravity
+        self.acceleration = 0.5
+        self.friction = 0.3
+        self.hit_registered = False
 
     def move(self, dx, dy):
         self.rect.x += dx
@@ -265,9 +288,8 @@ class Player(pygame.sprite.Sprite):
     # This is going to move our character in the correct direction and handle things like updating
     #   the animation and all the stuff that we constantly need to do for our character
     def loop(self, fps):
+        # Apply gravity
         self.y_vel += min(1, (self.fall_count / fps) * self.GRAVITY)
-        # For every frame in the loop, we increase y_vel by our gravity
-        #  (varies on how long the character has been falling for)
         self.move(self.x_vel, self.y_vel)
 
         if self.hit:
@@ -286,6 +308,19 @@ class Player(pygame.sprite.Sprite):
             self.hearts = 0  # Time's up, player fails
 
         self.update_sprite()
+
+        # Handle powerup effects
+        if self.active_powerup:
+            current_time = pygame.time.get_ticks()
+            time_elapsed = current_time - self.powerup_start_time
+
+            if time_elapsed >= self.powerup_duration - 2000:
+                self.powerup_glow_timer += 1
+                if self.powerup_glow_timer % 30 == 0:
+                    self.powerup_glow_pulse = not self.powerup_glow_pulse
+
+            if time_elapsed >= self.powerup_duration:
+                self.deactivate_powerup()
 
     # update our sprite every single frame
     def update_sprite(self):
@@ -308,10 +343,24 @@ class Player(pygame.sprite.Sprite):
                         self.ANIMATION_DELAY) % len(sprites)  # make sprite dynamic
         self.sprite = sprites[sprite_index]
         self.animation_count += 1
-        self.update()
 
     def draw(self, win, offset_x):
-        win.blit(self.sprite, (self.rect.x - offset_x, self.rect.y))
+        sprite_to_draw = self.sprite
+        if self.active_powerup:
+            glow_color = self.get_powerup_glow_color()
+            if glow_color:
+                if self.powerup_glow_pulse:
+                    surface = pygame.Surface(self.sprite.get_size(), pygame.SRCALPHA)
+                    surface.fill(glow_color + (128,))  # Adjust alpha for pulse effect
+                    sprite_to_draw = self.sprite.copy()
+                    sprite_to_draw.blit(surface, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+                else:
+                    surface = pygame.Surface(self.sprite.get_size(), pygame.SRCALPHA)
+                    surface.fill(glow_color + (64,))  # Adjust alpha for constant glow
+                    sprite_to_draw = self.sprite.copy()
+                    sprite_to_draw.blit(surface, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        win.blit(sprite_to_draw, (self.rect.x - offset_x, self.rect.y))
 
     # Constantly update the rectangle that bounds our character based on the sprite that we're showing
     def update(self):
@@ -335,23 +384,64 @@ class Player(pygame.sprite.Sprite):
 
     # Character jumps
     def jump(self):
-        self.y_vel = -self.GRAVITY * 8
-        self.animation_count = 0
-        self.jump_count += 1
-        if self.jump_count == 1:
+        if self.jump_count < 2:
+            self.y_vel = self.INITIAL_JUMP_VELOCITY
+            self.animation_count = 0
+            self.jump_count += 1
             self.fall_count = 0  # reset to remove any gravity accumulated
 
     # Character get hit (ex. by fire...)
     def make_hit(self):
+        if not self.hit_registered:
+            self.hearts -= 1
+            self.hit_registered = True
         self.hit = True
 
     def respawn(self):
-        self.rect.x, self.rect.y = 100, 100
+        if self.checkpoint:
+            self.rect.x, self.rect.y = self.checkpoint.rect.x, self.checkpoint.rect.y
+        else:
+            self.rect.x, self.rect.y = 100, 100
         self.y_vel = 0
         self.x_vel = 0
-        self.hearts -= 1
+        self.hit_registered = False
         return 0
 
+    def set_checkpoint(self, checkpoint):
+        self.checkpoint = checkpoint
+
+    def reset_checkpoint(self):
+        self.checkpoint = None
+
+    def activate_powerup(self, powerup):
+        self.active_powerup = powerup
+        self.powerup_start_time = pygame.time.get_ticks()
+        self.powerup_duration = powerup.duration
+        if powerup.powerup_type == "speed_boost":
+            self.default_vel = self.PLAYER_VEL
+            self.PLAYER_VEL = self.default_vel * 3  # Substantially increased speed boost
+        elif powerup.powerup_type == "jump_boost":
+            self.default_gravity = self.GRAVITY
+            self.GRAVITY = self.default_gravity * 0.5  # Significantly enhanced jump
+        elif powerup.powerup_type == "extra_life":
+            self.hearts += 3  # Overpowered extra lives
+
+    def deactivate_powerup(self):
+        if self.active_powerup:
+            if self.active_powerup.powerup_type == "speed_boost":
+                self.PLAYER_VEL = self.default_vel
+            elif self.active_powerup.powerup_type == "jump_boost":
+                self.GRAVITY = self.default_gravity
+        self.active_powerup = None
+        self.powerup_start_time = 0
+        self.powerup_duration = 0
+        self.powerup_glow_timer = 0
+        self.powerup_glow_pulse = False
+
+    def get_powerup_glow_color(self):
+        if self.active_powerup:
+            return self.active_powerup.glow_color
+        return None
 
 # Class for all the objects, inherit from this class for specific objects
 class Object(pygame.sprite.Sprite):
@@ -369,9 +459,9 @@ class Object(pygame.sprite.Sprite):
 
 # Class for blocks
 class Block(Object):
-    def __init__(self, x, y, size):  # A block is a square, just need one dimension
+    def __init__(self, x, y, size, terrain_type="Terrain"):  # A block is a square, just need one dimension
         super().__init__(x, y, size, size)
-        block = get_block(size)
+        block = get_block(size, terrain_type)
         self.image.blit(block, (0, 0))
         self.mask = pygame.mask.from_surface(self.image)
 
@@ -425,39 +515,174 @@ class Door(Object):
 # Class for NPC
 class NPC(Object):
     ANIMATION_DELAY = 3
+    GRAVITY = 1
+    NPC_VEL = 5  # NPCs have their own velocity, independent of player
 
     def __init__(self, x, y, width, height):
         super().__init__(x, y, width, height, "npc")
         self.sprites = load_sprite_sheets("MainCharacters", "NinjaFrog", 32, 32, True)
         self.animation_count = 0
         self.direction = random.choice(["left", "right"])
-        self.speed = 2
-        self.update_sprite()
+        self.x_vel = 0
+        self.y_vel = 0
+        self.fall_count = 0
+        self.jump_count = 0
+        self.is_alive = True
+        self.update_sprite()  # Initialize sprite here
+        
+        # Set initial offset to ensure proper placement on platforms
+        self.rect.y += 1  # Small offset to prevent being partially in the floor
 
     def update_sprite(self):
-        sprite_sheet = "run"  # NPCs are always running
+        sprite_sheet = "run"
         sprite_sheet_name = sprite_sheet + "_" + self.direction
         sprites = self.sprites[sprite_sheet_name]
         sprite_index = (self.animation_count // self.ANIMATION_DELAY) % len(sprites)
         self.image = sprites[sprite_index]
         self.animation_count += 1
         self.mask = pygame.mask.from_surface(self.image)
-
-    def move(self):
-        if self.direction == "left":
-            self.rect.x -= self.speed
-        else:
-            self.rect.x += self.speed
-
-        if random.random() < 0.01:
-            self.direction = "left" if self.direction == "right" else "right"
         
+    # Updated loop method with independent physics and better collision detection
+    def loop(self, fps, objects, player):
+        # Set base velocity - independent of player's velocity
+        base_speed = self.NPC_VEL
+        self.x_vel = -base_speed if self.direction == "left" else base_speed
+
+        # Apply gravity
+        self.y_vel += min(1, (self.fall_count / fps) * self.GRAVITY)
+
+        # Store original position for collision detection
+        original_x = self.rect.x
+        original_y = self.rect.y
+
+        # Horizontal movement and collision
+        self.rect.x += self.x_vel
+        horizontal_collision = False
+        for obj in objects:
+            if obj is not self and isinstance(obj, Block) and self.rect.colliderect(obj.rect):
+                horizontal_collision = True
+                if self.x_vel > 0:
+                    self.rect.right = obj.rect.left
+                elif self.x_vel < 0:
+                    self.rect.left = obj.rect.right
+                self.direction = "left" if self.direction == "right" else "right"
+                break
+        
+        # Vertical movement and collision
+        self.rect.y += self.y_vel
+        vertical_collision = False
+        for obj in objects:
+            if obj is not self and isinstance(obj, Block) and self.rect.colliderect(obj.rect):
+                vertical_collision = True
+                if self.y_vel > 0:  # Landing on top of a block
+                    self.rect.bottom = obj.rect.top
+                    self.fall_count = 0
+                    self.y_vel = 0
+                elif self.y_vel < 0:  # Hitting the bottom of a block
+                    self.rect.top = obj.rect.bottom
+                    self.y_vel = 0
+                break
+
+        # Check if enemy is about to walk off the platform
+        if not horizontal_collision:  # Only check if we didn't collide horizontally
+            # Create a check rectangle based on direction
+            if self.direction == "left":
+                check_rect = pygame.Rect(self.rect.left - 10, self.rect.bottom + 1, 5, 10)
+            else:
+                check_rect = pygame.Rect(self.rect.right + 5, self.rect.bottom + 1, 5, 10)
+
+            on_platform = False
+            for obj in objects:
+                if obj is not self and isinstance(obj, Block) and check_rect.colliderect(obj.rect):
+                    on_platform = True
+                    break
+                    
+            if not on_platform:
+                # Reverse direction if about to walk off
+                self.direction = "left" if self.direction == "right" else "right"
+                # Reset position to before movement to prevent getting stuck
+                self.rect.x = original_x
+
+        self.fall_count += 1
         self.update_sprite()
 
     def update(self, player):
-        if self.rect.colliderect(player.rect):
-            player.make_hit()
+        if self.is_alive and self.rect.colliderect(player.rect):
+            # Check if player is above the enemy (jumping on it)
+            if player.rect.bottom <= self.rect.top + 10 and player.y_vel > 0:
+                self.die()
+                player.y_vel = -10  # Bounce player up
+            else:
+                player.make_hit()
+                player.hearts = max(player.hearts - 1, 0)  # Reduce hearts by 1 but not below 0
 
+    def die(self):
+        self.is_alive = False
+        # Don't call self.kill() here since we're managing objects in a list, not using sprite groups
+
+# Class for Checkpoint
+class Checkpoint(Object):
+    def __init__(self, x, y, width, height):
+        super().__init__(x, y, width, height, "checkpoint")
+        self.checkpoint_sprites = load_sprite_sheets("Items", "Checkpoints/Checkpoint", 64, 64, False)
+        self.image = self.checkpoint_sprites["Checkpoint (Flag Idle)(64x64)"][0]
+        self.mask = pygame.mask.from_surface(self.image)
+        self.active = False
+
+    def activate(self):
+        self.active = True
+        self.image = self.checkpoint_sprites["Checkpoint (Flag Out)(64x64)"][0]
+
+# Class for PowerUp
+class PowerUp(Object):
+    def __init__(self, x, y, powerup_type):
+        super().__init__(x, y, 32, 32, "powerup")
+        self.powerup_type = powerup_type
+        self.powerup_sprites = load_sprite_sheets("Items", "Fruits", 32, 32, False)
+        self.image = self.get_powerup_image(powerup_type)
+        self.mask = pygame.mask.from_surface(self.image)
+        self.duration = 5000  # 5 seconds
+        self.glow_color = self.get_powerup_glow_color(powerup_type)
+
+    def get_powerup_image(self, powerup_type):
+        if powerup_type == "speed_boost":
+            return self.powerup_sprites["Apple"][0]
+        elif powerup_type == "jump_boost":
+            return self.powerup_sprites["Bananas"][0]
+        elif powerup_type == "extra_life":
+            return self.powerup_sprites["Cherries"][0]
+        else:
+            return self.powerup_sprites["Kiwi"][0]
+
+    def get_powerup_glow_color(self, powerup_type):
+        if powerup_type == "speed_boost":
+            return (255, 255, 0)  # Yellow
+        elif powerup_type == "jump_boost":
+            return (0, 255, 255)  # Cyan
+        elif powerup_type == "extra_life":
+            return (255, 0, 255)  # Magenta
+        else:
+            return (0, 255, 0)  # Green
+
+# Function to fade out
+def fade_out(window):
+    fade = pygame.Surface((WIDTH, HEIGHT))
+    fade.fill((0, 0, 0))
+    for alpha in range(0, 256):
+        fade.set_alpha(alpha)
+        window.blit(fade, (0, 0))
+        pygame.display.update()
+        pygame.time.delay(2)
+
+# Function to fade in
+def fade_in(window):
+    fade = pygame.Surface((WIDTH, HEIGHT))
+    fade.fill((0, 0, 0))
+    for alpha in range(255, -1, -1):
+        fade.set_alpha(alpha)
+        window.blit(fade, (0, 0))
+        pygame.display.update()
+        pygame.time.delay(1)
 
 # Returns a list that contains all the background tiles aht we need to draw
 def get_background(name):  # name = colour of background
@@ -476,7 +701,7 @@ def get_background(name):  # name = colour of background
 
 
 # Draw function
-def draw(window, background, bg_image, player, objects, offset_x):
+def draw(window, background, bg_image, player, objects, offset_x, level):
     for tile in background:  # looping through every tile and then draw bg_image at that position
         window.blit(bg_image, tile)  #   which will fill the entire screen with bg_image
 
@@ -489,8 +714,19 @@ def draw(window, background, bg_image, player, objects, offset_x):
     hearts_text = font.render(f"Hearts: {player.hearts}", True, (255, 0, 0))
     time_left = max(0, LEVEL_TIME - (pygame.time.get_ticks() - player.start_time) // 1000)
     timer_text = font.render(f"Time: {time_left}s", True, (0, 0, 0))
+    level_text = font.render(f"Level: {level}", True, (0, 0, 0))
     window.blit(hearts_text, (10, 10))
     window.blit(timer_text, (10, 50))
+    window.blit(level_text, (WIDTH - 100, 10))
+
+    # Draw powerup display
+    if player.active_powerup:
+        powerup_text = font.render(f"Powerup: {player.active_powerup.powerup_type}", True, player.active_powerup.glow_color)
+        powerup_time_left = max(0, player.powerup_duration - (pygame.time.get_ticks() - player.powerup_start_time)) // 1000
+        powerup_timer_text = font.render(f"Time Left: {powerup_time_left}s", True, player.active_powerup.glow_color)
+        window.blit(powerup_text, (10, 90))
+        window.blit(powerup_timer_text, (10, 130))
+
     pygame.display.update()
 
 
@@ -517,7 +753,7 @@ def collide(player, objects, dx):
     player.update()  # update the mask
     collided_obj = None
     for obj in objects:
-        if pygame.sprite.collide_mask(player, obj):  # check collide if moving in that direction
+        if obj.name != "door" and pygame.sprite.collide_mask(player, obj):  # check collide if moving in that direction
             collided_obj = obj
             break
 
@@ -543,57 +779,140 @@ def handle_move(player, objects):
     vertical_collide = handle_vertical_collision(player, objects, player.y_vel)
     to_check = [collide_left, collide_right, *vertical_collide]
 
+    objects_to_remove = []  # Create a list to store objects that need to be removed
     for obj in to_check:
         if obj and obj.name == "fire":
             player.make_hit()
-
+        if obj and obj.name == "checkpoint":
+            obj.activate()
+            player.set_checkpoint(obj)
+        if obj and obj.name == "powerup" and obj in objects:  # Check if the object is still in the list
+            player.activate_powerup(obj)
+            objects_to_remove.append(obj)  # Add to removal list instead of removing immediately
+    
+    # Remove objects after iteration is complete
+    for obj in objects_to_remove:
+        if obj in objects:  # Double-check the object is still in the list
+            objects.remove(obj)
 
 def generate_level(level):
     random.seed(level)
     block_size = 96
+    terrain_types = ["Terrain", "Terrain2", "Terrain3"]
+    terrain_type = random.choice(terrain_types)
+    powerup_types = ["speed_boost", "jump_boost", "extra_life"]
 
     # Generate floor blocks with gaps
     floor = []
     for i in range(-WIDTH // block_size, (WIDTH * 5) // block_size):
         if random.choice([True, False]):  # Randomly create gaps
-            floor.append(Block(i * block_size, HEIGHT - block_size, block_size))
+            floor.append(Block(i * block_size, HEIGHT - block_size, block_size, terrain_type))
 
     # Generate left and right borders
-    left_border = [Block(-block_size, HEIGHT - block_size * (i + 1), block_size) for i in range(HEIGHT // block_size)]
-    right_border = [Block((WIDTH * 5) // block_size * block_size, HEIGHT - block_size * (i + 1), block_size) for i in range(HEIGHT // block_size)]
+    left_border = [Block(-block_size, HEIGHT - block_size * (i + 1), block_size, terrain_type) for i in range(HEIGHT // block_size)]
+    right_border = [Block((WIDTH * 5) // block_size * block_size, HEIGHT - block_size * (i + 1), block_size, terrain_type) for i in range(HEIGHT // block_size)]
 
     # Generate random platforms and fire
     objects = floor.copy()
     objects.extend(left_border)
     objects.extend(right_border)
+
+    # Ensure a platform under the spawn point
+    spawn_platform = Block(100, HEIGHT - block_size * 2, block_size, terrain_type)
+    objects.append(spawn_platform)
+
+    npc_spawn_chance = min(0.1 * level, 0.5)  # Increase NPC spawn chance with level
+    # Ensure at least one NPC in the first few levels
+    if level <= 3:
+        npc_x = random.randint(5, 10) * block_size
+        npc_y = HEIGHT - block_size * random.randint(2, 6) - 64
+        npc = NPC(npc_x, npc_y, 32, 32)
+        objects.append(npc)
+
     for i in range(5, (WIDTH * 5) // block_size, random.randint(10, 20)):
         platform_length = random.randint(3, 10)
         platform_height = random.randint(2, 6)
-        platform = [Block(i * block_size + j * block_size, HEIGHT - block_size * platform_height, block_size)
+        platform = [Block(i * block_size + j * block_size, HEIGHT - block_size * platform_height, block_size, terrain_type)
                     for j in range(platform_length)]
         objects.extend(platform)
 
-        if random.choice([True, False]):
+        # Add fire with increasing frequency
+        if random.random() < min(0.05 * level, 0.2):
             fire = Fire(i * block_size, HEIGHT - block_size * platform_height - 64, 16, 32)
             fire.on()
             objects.append(fire)
 
-    # Add invisible block at the bottom of the screen
-    invisible_block = Block(HEIGHT, WIDTH * 5000, block_size)
-    objects.append(invisible_block)
+        # Add checkpoints
+        if i % (20 * block_size) == 0:
+            checkpoint = Checkpoint(i * block_size, HEIGHT - block_size * 2, 64, 64)
+            objects.append(checkpoint)
 
-    # Add end point (door)
-    door = Door((WIDTH * 5) // block_size * block_size - block_size, HEIGHT - block_size * 2, 64, 128)
-    objects.append(door)
-
-    # Add NPCs
-    for i in range(5, (WIDTH * 5) // block_size, random.randint(20, 30)):
-        if random.choice([True, False]):
+        # Add NPCs with increasing frequency
+        if random.random() < npc_spawn_chance:
             npc = NPC(i * block_size, HEIGHT - block_size * platform_height - 64, 32, 32)
             objects.append(npc)
 
+        # Add power-ups
+        if random.random() < 0.1:
+            powerup_type = random.choice(powerup_types)
+            powerup = PowerUp(i * block_size, HEIGHT - block_size * platform_height - 64, powerup_type)
+            objects.append(powerup)
+
+    # Add invisible block at the bottom of the screen
+    invisible_block = Block(HEIGHT, WIDTH * 5000, block_size, terrain_type)
+    objects.append(invisible_block)
+
+    # Add end point (door) with platform underneath
+    door_x = (WIDTH * 5) // block_size * block_size - block_size
+    door_y = HEIGHT - block_size * 2
+    door = Door(door_x, door_y, 64, 128)
+    for i in range(3):
+        objects.append(Block(door_x - i * block_size, door_y + 128, block_size, terrain_type))
+
     return objects, invisible_block, door
 
+# Function to save game progress
+def save_game(player, level):
+    data = {
+        "hearts": player.hearts,
+        "level": level,
+        "checkpoint_x": player.checkpoint.rect.x if player.checkpoint else None,
+        "checkpoint_y": player.checkpoint.rect.y if player.checkpoint else None,
+        "active_powerup": player.active_powerup.powerup_type if player.active_powerup else None,
+        "powerup_start_time": player.powerup_start_time,
+        "powerup_duration": player.powerup_duration
+    }
+    with open(SAVE_FILE, "w") as f:
+        json.dump(data, f)
+
+# Function to load game progress
+def load_game(player):
+    try:
+        with open(SAVE_FILE, "r") as f:
+            data = json.load(f)
+            player.hearts = data["hearts"]
+            level = data["level"]
+            checkpoint_x = data["checkpoint_x"]
+            checkpoint_y = data["checkpoint_y"]
+            active_powerup = data["active_powerup"]
+            powerup_start_time = data["powerup_start_time"]
+            powerup_duration = data["powerup_duration"]
+
+            if checkpoint_x is not None and checkpoint_y is not None:
+                player.checkpoint = Checkpoint(checkpoint_x, checkpoint_y, 64, 64)
+            else:
+                player.reset_checkpoint()
+
+            if active_powerup:
+                powerup_type = active_powerup
+                powerup = PowerUp(0, 0, powerup_type)  # Create a dummy powerup object
+                player.activate_powerup(powerup)
+                player.powerup_start_time = powerup_start_time
+                player.powerup_duration = powerup_duration
+
+            return level
+    except FileNotFoundError:
+        return 1
 
 # Function to restart the game
 def restart_game():
@@ -732,7 +1051,7 @@ def main():
 
                     player.loop(FPS)
                     handle_move(player, objects)
-                    draw(window, background, bg_image, player, objects, offset_x)
+                    draw(window, background, bg_image, player, objects, offset_x, level)
                     pause_button.draw(window)
 
                     if ((player.rect.right - offset_x >= WIDTH - scroll_area_width) and player.x_vel > 0) or \
@@ -750,37 +1069,92 @@ def main():
                     if player.rect.colliderect(invisible_block.rect):
                         player.hit = True
 
+                    # Reset the level if player is hit
+                    if player.hit:
+                        offset_x = player.respawn()  # deducts a heart and resets player's position
+                        objects, invisible_block, door = generate_level(level)
+                        background, bg_image = get_background("Blue.png")
+                        player.hit = False # Reset hit status
+                        run = True  # Continue the level
+                        continue
+
                     # Check if player reaches the door
                     if player.rect.colliderect(door.rect):
+                        fade_out(window)
                         level += 1
-                        break
+                        player = Player(100, 100, 50, 50)
+                        player.hearts = HEARTS  # Reset hearts
+                        player.level = level  # Update player's level
+                        objects, invisible_block, door = generate_level(level)
+                        offset_x = 0
+                        background, bg_image = get_background("Blue.png")
+                        fade_in(window)
 
                     # Check if player is dead
-                    if player.hit_count > FPS * 2:
-                        font = pygame.font.SysFont(None, 75)
-                        text = font.render("You Died", True, (255, 0, 0))
-                        text_rect = text.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 50))
-                        window.blit(text, text_rect)
-
-                        restart_button = Button(WIDTH // 2 - 100, HEIGHT // 2, 200, 50, "Restart", PIXEL_FONT, (0, 255, 0), (0, 200, 0))
-                        restart_button.update()
-                        restart_button.draw(window)
-
-                        pygame.display.update()
-
                     if player.hearts <= 0:
                         font = pygame.font.SysFont(None, 75)
                         text = font.render("Game Over", True, (255, 0, 0))
-                        text_rect = text.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 50))
+                        text_rect = text.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 150))
                         window.blit(text, text_rect)
-                        pygame.display.update()
-                        pygame.time.wait(3000)
-                        run = False
-                        run_game = False
-                        break
 
-                pygame.quit()
-                quit()
+                        restart_button = Button(WIDTH // 2 - 150, HEIGHT // 2 - 30, 300, 50, "Restart Level", PIXEL_FONT, (0, 255, 0), (0, 200, 0))
+                        menu_button = Button(WIDTH // 2 - 150, HEIGHT // 2 + 50, 300, 50, "Main Menu", PIXEL_FONT, (255, 0, 0), (200, 0, 0))
+
+                        restart_button.update()
+                        menu_button.update()
+
+                        restart_button.draw(window)
+                        menu_button.draw(window)
+
+                        pygame.display.update()
+
+                        waiting = True
+                        while waiting:
+                            for event in pygame.event.get():
+                                if event.type == pygame.QUIT:
+                                    pygame.quit()
+                                    quit()
+                                # ----- Modified restart button branch -----
+                                if restart_button.is_clicked(event):
+                                    save_game(player, level)  # Save progress before restarting
+                                    player.hearts = HEARTS
+                                    objects, invisible_block, door = generate_level(level)
+                                    offset_x = 0
+                                    waiting = False  # Exit waiting loop to resume gameplay
+                                # ----------------------------------------------
+                                if menu_button.is_clicked(event):
+                                    run = False
+                                    waiting = False
+                                    player.hearts = HEARTS  # Reset hearts when going to main menu
+                                    level = 1           # Reset level when going to main menu
+                                    character_selected = False  # Return to character selection
+                                    break
+                        if not run:
+                            break  # Break out to return to the main game screen
+                        continue  # Proceed with the restarted level
+
+                    # Reset the level if player is hit
+                    if player.hit:
+                        offset_x = player.respawn()  # deducts a heart and resets player's position
+                        objects, invisible_block, door = generate_level(level)
+                        background, bg_image = get_background("Blue.png")
+                        run = False  # exit inner loop to restart level
+                        continue
+
+                    # Update NPCs using the new move method.
+                    for obj in objects:
+                        if isinstance(obj, NPC) and obj.is_alive:  # Only update if the NPC is alive
+                            obj.loop(FPS, objects, player)
+                            obj.update(player)  # Call update separately to check player collision
+                            # Check for player jumping on NPC (this is already handled in the NPC.update method)
+                            if not obj.is_alive:  # If the enemy just died
+                                powerup_types = ["speed_boost", "jump_boost", "extra_life"]
+                                powerup_type = random.choice(powerup_types)
+                                powerup = PowerUp(obj.rect.x, obj.rect.y, powerup_type)
+                                objects.append(powerup)
+                                objects.remove(obj)  # Remove the dead NPC from the objects list
+
+                break  # return to main menu or restart gameplay
         elif screen == "settings":
             controls = settings_screen()
         elif screen == "help":
